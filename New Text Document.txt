@@ -1,0 +1,295 @@
+from flask import Flask, request, jsonify
+import pandas as pd
+import pickle
+import os
+from datetime import datetime, timedelta
+import threading
+import csv
+import math
+
+app = Flask(__name__)
+
+# ---------- Config ----------
+HTTP_MODEL_PATH = "http_model.pkl"   # change to your path
+TCP_MODEL_PATH  = "tcp_model.pkl"    # change to your path
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Volumetric reference arrays configuration
+VOL_WINDOW_MINUTES = 10   # how many minutes each reference covers
+VOL_STEP_SECONDS = 60     # resolution
+NUM_REFS = 3              # create 3 different reference arrays
+
+# thread-safe model holders
+_models = {"http": None, "tcp": None}
+_models_lock = threading.Lock()
+
+# ------------- Helpers -------------
+def safe_load_model(path):
+    """
+    Load a pickled model. Warning: unpickling is unsafe for untrusted files.
+    """
+    if not os.path.exists(path):
+        app.logger.warning(f"Model file not found: {path}")
+        return None
+    with open(path, "rb") as f:
+        model = pickle.load(f)
+    return model
+
+def load_models():
+    with _models_lock:
+        _models["http"] = safe_load_model(HTTP_MODEL_PATH)
+        _models["tcp"]  = safe_load_model(TCP_MODEL_PATH)
+
+# call at startup
+load_models()
+
+def df_from_json_payload(payload):
+    """
+    Accept either a single dict or list of dicts and return a pandas DataFrame.
+    """
+    if isinstance(payload, dict):
+        return pd.DataFrame([payload])
+    elif isinstance(payload, list):
+        return pd.DataFrame(payload)
+    else:
+        raise ValueError("Payload must be a JSON object or array of objects.")
+
+def align_df_to_model(df, model):
+    """
+    Try to reorder/select DataFrame columns to fit model input.
+    If model has attribute 'feature_names_in_' (sklearn newer), use that.
+    Otherwise we pass the df as-is (user responsibility).
+    """
+    if model is None:
+        return df
+    cols = None
+    if hasattr(model, "feature_names_in_"):
+        cols = list(model.feature_names_in_)
+    elif hasattr(model, "n_features_in_") and hasattr(model, "coef_"):
+        # heuristic: if model has coef_ but not feature names, assume df columns match
+        cols = list(df.columns)
+    if cols:
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Input JSON is missing required model features: {missing}")
+        return df[cols]
+    return df
+
+def model_predict_safe(model, X_df):
+    """
+    Return (pred, prob_or_none). Tries predict_proba, then decision_function, then predict.
+    """
+    if model is None:
+        raise ValueError("Model not loaded.")
+    X = X_df.values
+    pred = None
+    prob = None
+    try:
+        if hasattr(model, "predict_proba"):
+            prob_arr = model.predict_proba(X)
+            # if binary, take prob of class 1
+            if prob_arr.ndim == 2 and prob_arr.shape[1] > 1:
+                prob = prob_arr[:, 1].tolist()
+            else:
+                prob = prob_arr.tolist()
+            pred = model.predict(X).tolist()
+        elif hasattr(model, "decision_function"):
+            dec = model.decision_function(X)
+            # map decision to probability-like score via sigmoid
+            def _sig(x): return 1 / (1 + math.exp(-x))
+            prob = [_sig(float(x)) for x in (dec if hasattr(dec, "__iter__") else [dec])]
+            pred = model.predict(X).tolist()
+        else:
+            pred = model.predict(X).tolist()
+    except Exception as e:
+        raise RuntimeError(f"Model prediction failed: {e}")
+    return pred, prob
+
+def log_predictions(logfile, inputs_df, preds, probs):
+    """
+    Append predictions to a CSV log. Includes timestamp and original input JSON columns.
+    """
+    path = os.path.join(LOG_DIR, logfile)
+    write_header = not os.path.exists(path)
+    rows = []
+    ts = datetime.utcnow().isoformat() + "Z"
+    for i, row in inputs_df.iterrows():
+        rowdict = row.to_dict()
+        rowdict.update({
+            "_pred": preds[i] if isinstance(preds, list) else preds,
+            "_prob": probs[i] if probs is not None and isinstance(probs, list) else probs,
+            "_utc_ts": ts
+        })
+        rows.append(rowdict)
+
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        if write_header:
+            writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+# ------------- Volumetric reference arrays -------------
+def generate_reference_arrays(num_refs=NUM_REFS, window_minutes=VOL_WINDOW_MINUTES, step_seconds=VOL_STEP_SECONDS):
+    """
+    Create `num_refs` arrays. Each array is list of dicts: {'time': ISO, 'volume': int}
+    They will cover [now - window, now + window) to give flexibility for incoming times.
+    Arrays are variations of a base pattern (sinusoidal + offsets) so predictions vary by array.
+    """
+    now = datetime.utcnow().replace(second=0, microsecond=0)
+    start = now - timedelta(minutes=window_minutes//2)
+    n_steps = (window_minutes * 60) // step_seconds
+    refs = []
+    base_pattern = [1000 + 100 * math.sin(i/2.0) for i in range(n_steps)]  # base volumes
+    for r in range(num_refs):
+        arr = []
+        offset = r * 0.25  # small phase shift between refs
+        scale = 1.0 + 0.2 * r
+        for i in range(n_steps):
+            t = start + timedelta(seconds=i*step_seconds)
+            vol = max(0, int((base_pattern[i] * scale) + (r*50) + (10 * math.cos(i/3.0 + offset))))
+            arr.append({"time": t.isoformat() + "Z", "volume": vol})
+        refs.append(arr)
+    return refs
+
+REFERENCE_ARRAYS = generate_reference_arrays()
+
+def find_nearest_threshold(ref_array, incoming_time_iso, allow_seconds=30):
+    """
+    Try to find the threshold volume in ref_array nearest to incoming_time_iso.
+    allow_seconds: max difference allowed. Returns threshold volume or None if not found.
+    """
+    try:
+        inc = datetime.fromisoformat(incoming_time_iso.replace("Z", "+00:00"))
+    except Exception:
+        # try parsing without timezone assumption
+        inc = datetime.fromisoformat(incoming_time_iso)
+    nearest = None
+    min_delta = None
+    for item in ref_array:
+        t = datetime.fromisoformat(item["time"].replace("Z", "+00:00"))
+        delta = abs((t - inc).total_seconds())
+        if min_delta is None or delta < min_delta:
+            min_delta = delta
+            nearest = item
+    if min_delta is not None and min_delta <= allow_seconds:
+        return nearest["volume"], nearest["time"]
+    return None, None
+
+# ------------- Routes -------------
+@app.route("/http_ddos", methods=["POST"])
+def http_ddos():
+    payload = request.get_json()
+    try:
+        df = df_from_json_payload(payload)
+    except Exception as e:
+        return jsonify({"error": f"Invalid JSON payload: {e}"}), 400
+
+    model = _models.get("http")
+    try:
+        X = align_df_to_model(df, model)
+    except Exception as e:
+        return jsonify({"error": f"Input alignment error: {e}"}), 400
+
+    try:
+        preds, probs = model_predict_safe(model, X)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # log
+    try:
+        log_predictions("http_predictions.csv", df, preds, probs)
+    except Exception as e:
+        app.logger.exception("Failed logging predictions")
+
+    response = {"predictions": preds}
+    if probs is not None:
+        response["probabilities"] = probs
+    return jsonify(response), 200
+
+@app.route("/tcp_ddos", methods=["POST"])
+def tcp_ddos():
+    payload = request.get_json()
+    try:
+        df = df_from_json_payload(payload)
+    except Exception as e:
+        return jsonify({"error": f"Invalid JSON payload: {e}"}), 400
+
+    model = _models.get("tcp")
+    try:
+        X = align_df_to_model(df, model)
+    except Exception as e:
+        return jsonify({"error": f"Input alignment error: {e}"}), 400
+
+    try:
+        preds, probs = model_predict_safe(model, X)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # log
+    try:
+        log_predictions("tcp_predictions.csv", df, preds, probs)
+    except Exception as e:
+        app.logger.exception("Failed logging predictions")
+
+    response = {"predictions": preds}
+    if probs is not None:
+        response["probabilities"] = probs
+    return jsonify(response), 200
+
+@app.route("/volumetric", methods=["POST"])
+def volumetric():
+    """
+    Expect incoming JSON:
+    { "time": "2025-09-24T12:34:00Z", "volume": 12345 }
+    or an array of such objects.
+    Returns whether volumetric ddos detected (if incoming volume > threshold for that time),
+    and shows the reference arrays used.
+    """
+    payload = request.get_json()
+    # accept single or list
+    incoming_list = payload if isinstance(payload, list) else [payload]
+
+    results = []
+    for inc in incoming_list:
+        if not isinstance(inc, dict) or "time" not in inc or "volume" not in inc:
+            results.append({"error": "Each item must be object with 'time' and 'volume'."})
+            continue
+        inc_time = inc["time"]
+        inc_vol = inc["volume"]
+        triggered_refs = []
+        ref_info = []
+        for idx, ref in enumerate(REFERENCE_ARRAYS):
+            threshold, match_time = find_nearest_threshold(ref, inc_time, allow_seconds=60)
+            ref_info.append({"ref_index": idx, "threshold_time": match_time, "threshold_volume": threshold})
+            if threshold is not None and inc_vol > threshold:
+                triggered_refs.append(idx)
+        is_ddos = len(triggered_refs) > 0
+        results.append({
+            "time": inc_time,
+            "volume": inc_vol,
+            "ddos": bool(is_ddos),
+            "triggered_refs": triggered_refs,
+            "refs": ref_info
+        })
+
+    # include the full reference arrays for transparency (optional)
+    return jsonify({"results": results, "reference_arrays_count": len(REFERENCE_ARRAYS)}), 200
+
+# ------------- Admin endpoints (optional) -------------
+@app.route("/reload_models", methods=["POST"])
+def reload_models():
+    """Reload models from disk (for ops). No auth here — add if needed."""
+    load_models()
+    return jsonify({"status": "models reloaded"}), 200
+
+@app.route("/refs", methods=["GET"])
+def get_refs():
+    """Return the generated reference arrays (for debugging)."""
+    return jsonify({"reference_arrays": REFERENCE_ARRAYS, "count": len(REFERENCE_ARRAYS)}), 200
+
+# ------------- Run -------------
+if __name__ == "__main__":
+    # Development server. Use gunicorn/uvicorn behind a reverse proxy in prod.
+    app.run(host="0.0.0.0", port=5000, debug=True)
