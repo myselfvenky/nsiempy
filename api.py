@@ -5,6 +5,14 @@ from flask import Flask, request, jsonify
 import pandas as pd
 import joblib
 import warnings
+from flask import Flask
+from flask_cors import CORS
+import requests 
+import json
+
+
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Suppress scikit-learn version warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -19,7 +27,6 @@ encoder = joblib.load("label_encoder.pkl")
 model_http = tf.keras.models.load_model("lstm_model.h5", compile=True)
 model_tcp = tf.keras.models.load_model('model_tcp.h5', compile=True)
 
-app = Flask(__name__)
 
 FEATURE_ORDER = [
     "Flow Duration",
@@ -106,29 +113,58 @@ def predict_http():
     if not data:
         return jsonify({"error": "Send JSON with 'features' key"}), 400
 
-    # Turn input into numpy array
-    df = pd.DataFrame([[data.get(col, 0) for col in FEATURE_ORDER]],columns=FEATURE_ORDER)
+    # Process input for model
+    df = pd.DataFrame([[data.get(col, 0) for col in FEATURE_ORDER]], columns=FEATURE_ORDER)
     X_proc = preprocessor.transform(df)
-    # Reshape for LSTM (samples, timesteps=1, features)
     X_lstm = X_proc.reshape((X_proc.shape[0], 1, X_proc.shape[1]))
-
-    # Predict
     probs = model_http.predict(X_lstm)
     pred_index = int(np.argmax(probs, axis=1)[0])
     pred_label = encoder.inverse_transform([pred_index])[0]
 
+    try:
+        # 1️⃣ Create payload with only pred_label and isAnalyzed=true
+        payload_data = {
+            "data": [pred_label],  # Only pred_label
+            "isAnalyzed": True     # Make sure backend uses this field
+        }
+        payload_resp = requests.post(
+            "http://localhost:5000/payload",
+            data=json.dumps(payload_data),
+            headers={"Content-Type": "application/json"},
+        )
+        payload_resp_json = payload_resp.json()
+        print("Payload created:", payload_resp_json)
+
+        # 2️⃣ Log attack using pred_label
+        attack_payload = {
+            "attackType": pred_label,
+            "payloadId": 0,  # Or you can use payload_resp_json.payloadId if returned
+        }
+        response = requests.post(
+            "http://localhost:5000/attacks",
+            data=json.dumps(attack_payload),
+            headers={"Content-Type": "application/json"},
+        )
+        print("Attack logged:", response.text)
+
+    except Exception as e:
+        print("Error sending to localhost:5000:", e)
+
+    # Final response
     return jsonify({
         "predicted_index": pred_index,
-        "predicted_label": pred_label,
-        "probabilities": probs.tolist()
+        "attackType": pred_label,
+        "probabilities": probs.tolist(),
     })
-    
+
+
+
 @app.route('/tcp_ddos', methods=['POST'])
 def predict_tcp():
     try:
         # Get input JSON
         data = request.get_json()
-
+        print(data)
         # Convert dict to dataframe
         df = pd.DataFrame([data])
         
@@ -191,5 +227,3 @@ def predict_volumetric():
 
 if __name__ == "__main__":
     app.run(debug=True)
-
-predict_volumetric()
