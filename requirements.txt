@@ -1,6 +1,7 @@
+scikit-learn==1.7.2
 flask
+flask-cors
 numpy
 pandas
 tensorflow
-scikit-learn
 joblib
